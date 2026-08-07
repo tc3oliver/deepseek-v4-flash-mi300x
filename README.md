@@ -1,8 +1,10 @@
-# DeepSeek V4 Flash on a single AMD MI300X
+# DeepSeek V4 Flash on AMD MI300X
 
-This repository contains the configuration and patches I use to run [`deepseek-ai/DeepSeek-V4-Flash-0731`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) on **one AMD MI300X** in production. It includes the Docker Compose stack, SHA-256-pinned file overlays, reference diffs against upstream, and tuning tables. The checkpoint runs as shipped, without additional weight quantization or offload.
+This repository contains the configuration and patches I use to run [`deepseek-ai/DeepSeek-V4-Flash-0731`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) on **AMD MI300X** in production. It includes the Docker Compose stack, SHA-256-pinned file overlays, reference diffs against upstream, and tuning tables. The checkpoint runs as shipped, without additional weight quantization or offload.
 
-Results from the pinned stack (vLLM ROCm nightly `0.26.1rc1.dev229+g124154a88.rocm723`, AITER `0.1.19`):
+**Default deployment: 2× MI300X, `--tensor-parallel-size 2` (pure tensor parallel; expert parallel is not enabled).** Single-GPU (TP=1) also works — set `--tensor-parallel-size 1` — and is what the correctness/performance numbers below were originally measured on; see [Tensor parallel (2× MI300X)](#tensor-parallel-2-mi300x) for what carries over and what still needs re-validation on 2 GPUs.
+
+Results from the pinned stack (vLLM ROCm nightly `0.26.1rc1.dev229+g124154a88.rocm723`, AITER `0.1.19`) — **validated baseline: 1× MI300X, TP=1**:
 
 | Metric | Result |
 | --- | ---: |
@@ -13,17 +15,19 @@ Results from the pinned stack (vLLM ROCm nightly `0.26.1rc1.dev229+g124154a88.ro
 | Context | 256K validated (the architecture supports 1M) |
 | Weights in HBM | 156.67 GiB — **no additional quantization or weight offload** |
 
+TP=2 runtime validation is pending (no throughput/correctness re-measurement on 2 GPUs yet — see below); do not read the table above as TP=2 results.
+
 The official vLLM recipe targets NVIDIA and newer AMD hardware. Running the model reliably on MI300X required fixes for its FP8 format, MoE routing at high concurrency, causal speculative verification, CPU-KV synchronization, and several untuned kernel shapes. This repository collects those fixes and pins the versions used in production.
 
 ---
 
 ## Why MI300X
 
-The MI300X has **192 GB of HBM3** and 5.3 TB/s of memory bandwidth, with 2.4× the HBM capacity of an H100 SXM5 ([AMD](https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html)). [Doubleword's write-up](https://fergusfinn.com/blog/deepseek-v4-flash-mi300x/) estimates that it costs roughly half as much at list price. For this 304B-parameter checkpoint, the memory capacity allows a simple single-GPU deployment:
+The MI300X has **192 GB of HBM3** and 5.3 TB/s of memory bandwidth, with 2.4× the HBM capacity of an H100 SXM5 ([AMD](https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html)). [Doubleword's write-up](https://fergusfinn.com/blog/deepseek-v4-flash-mi300x/) estimates that it costs roughly half as much at list price. For this 304B-parameter checkpoint, the memory capacity allows a simple deployment on one card, or `TP=2` for more headroom and throughput:
 
-- The entire model fits in HBM without PCIe weight streaming or layer offload.
-- There is room for a 20 GB GPU KV pool and a 96 GiB CPU tier for evicted prefix-cache entries.
-- One card handles 2–8 typical concurrent streams and bursts of up to 64 streams.
+- The entire model fits in one card's HBM without PCIe weight streaming or layer offload (TP=1); TP=2 halves the per-GPU weight footprint and leaves substantially more HBM for KV cache.
+- On the validated TP=1 baseline, there is room for a 20 GB GPU KV pool (per GPU) and a 96 GiB CPU tier for evicted prefix-cache entries.
+- One card handles 2–8 typical concurrent streams and bursts of up to 64 streams (TP=1, validated).
 
 MI300X (CDNA3) implements the AMD/Graphcore `fnuz` variant of E4M3, while MI325X and newer use OCP-standard FP8 ([background](https://fergusfinn.com/blog/deepseek-v4-flash-mi300x/)). A kernel that assumes OCP semantics on MI300X can be wrong by a factor of two in the scale domain. Correctness on this FP8 implementation was the first priority; performance tuning came afterward.
 
@@ -36,7 +40,7 @@ This repository adds:
 1. **Correctness overlays** for the pinned ROCm nightly, including fixes not yet in upstream vLLM.
 2. **A validated serving configuration** with probabilistic DSpark drafting, block rejection, and static K=7. It uses a 2,048-token scheduler budget and a 1,024-token long-prefill cap to prevent a cold prompt from stalling other streams.
 3. **AITER GEMM tuning tables** for the recurring `gfx942` shapes the packaged tables were missing, plus a `gfx942` OGS geometry override for the MXFP4 experts.
-4. **A hybrid KV strategy**: 20 GB of `fp8_ds_mla` GPU cache + 96 GiB native CPU offload, with a load-path fencing fix that upstream [issue #47282](https://github.com/vllm-project/vllm/issues/47282) documents but [PR #47291](https://github.com/vllm-project/vllm/pull/47291) never merged.
+4. **A hybrid KV strategy**: `--kv-cache-memory-bytes 20000000000` of `fp8_ds_mla` GPU cache **per GPU** + `--kv-offloading-size 96` GiB native CPU offload, **aggregate across all TP ranks** (see [Runtime configuration](#runtime-configuration) for the per-GPU-vs-aggregate distinction), with a load-path fencing fix that upstream [issue #47282](https://github.com/vllm-project/vllm/issues/47282) documents but [PR #47291](https://github.com/vllm-project/vllm/pull/47291) never merged.
 
 ## Repository layout
 
@@ -62,6 +66,7 @@ The stack uses a digest-pinned official vLLM ROCm nightly with:
 
 - `--trust-remote-code` and the DeepSeek V4 tokenizer, reasoning, and tool parsers
 - KV cache: the CLI passes `--kv-cache-dtype fp8`; for DeepSeek V4 MLA, the pinned vLLM revision resolves this alias to `fp8_ds_mla` (UE8M0 block-scaled FP8, not generic unscaled FP8) with 256-token blocks. No forcing flag is added.
+- KV capacity flags have different TP semantics, per vLLM's own field docs (`vllm/config/cache.py`): **`--kv-cache-memory-bytes` is per GPU** (each TP rank reserves this many bytes for its local KV cache — at `TP=2` the pinned `20000000000` means 20 GB *per GPU*, 40 GB total), while **`--kv-offloading-size` is the aggregate CPU-offload buffer summed across all TP ranks** (the pinned `96` GiB is a total, not per GPU).
 - `VLLM_ROCM_USE_AITER=1` and `--moe-backend triton`; Triton OGS handles the grouped MXFP4 experts, while AITER handles attention and dense linear layers
 - DSpark-7 speculative decoding with probabilistic drafting and block rejection
 - full/breakable CUDA graph capture, giving one graph launch per token during steady decode
@@ -71,15 +76,15 @@ The stack uses a digest-pinned official vLLM ROCm nightly with:
 
 `compose.yaml` defaults to `--tensor-parallel-size 2` across two MI300X devices, using **pure tensor parallel — expert parallel is NOT enabled**. Under pure TP the 256 routed experts are not partitioned across ranks, so `num_local_experts` stays 256 and the gfx942 fast-routing and OGS geometry gates (both keyed on `== 256`) remain active. RCCL uses its defaults; both GPUs are reached through the existing `/dev/kfd` + `/dev/dri` device mounts and `ipc: host` (no extra RCCL environment is set — add one only if a runtime issue on your host demands it, and record why).
 
-Requirements beyond the single-GPU stack: a second MI300X (`gfx942`) on the same host and working ROCm peer access between the two GPUs. For single-GPU operation, set `--tensor-parallel-size` to `1`.
+Requirements beyond a single-GPU stack: a second MI300X (`gfx942`) on the same host and working ROCm peer access between the two GPUs. For single-GPU operation, set `--tensor-parallel-size` to `1`; on TP=1 the KV flags above collapse to the simple case (`--kv-cache-memory-bytes` is that one GPU's reservation, `--kv-offloading-size` is not summed across ranks).
 
-The single-stream and prefill numbers below were measured on one MI300X (TP=1); TP=2 throughput characteristics differ and must be re-measured. TP=2 correctness (tool-calling fixtures, long-context needle recall) must be re-validated on the 2-GPU host.
+**Validated baseline: 1× MI300X, TP=1. TP=2 runtime validation: pending.** Every throughput number, KV-capacity figure, concurrency/benchmark result, BFCL score, long-context recall, and HBM high-water mark quoted elsewhere in this README (the summary table, "Why MI300X", Performance, Production notes) was measured on the TP=1 baseline. None of it has been re-measured under TP=2 — attention partitioning, GEMM shard shapes, reduction order, MoE tensor sharding, and cross-GPU collectives all change under TP=2 and can shift both throughput and numerics. Before relying on TP=2 in production, re-run the tool-calling fixtures, BFCL subset, and long-context needle recall on the 2-GPU host, and re-measure throughput — do not assume the TP=1 numbers carry over.
 
 ## Deploying it
 
 ### 1. Host prerequisites
 
-One MI300X (`gfx942`, 304 CUs, ~192 GiB HBM), a working AMD kernel driver, recent Docker Compose, ~235 GiB RAM for the CPU KV tier, and ~500 GB disk (the model cache alone is ~156 GB).
+Two MI300X (`gfx942`, 304 CUs, ~192 GiB HBM each) for the default `TP=2` deployment — or one, if you set `--tensor-parallel-size 1` in `compose.yaml` (the validated TP=1 baseline). Also: a working AMD kernel driver, recent Docker Compose, ~235 GiB RAM for the CPU KV tier (TP=1 figure; see [Tensor parallel](#tensor-parallel-2-mi300x) for the per-GPU-vs-aggregate KV flag semantics under TP=2), and ~500 GB disk (the model cache alone is ~156 GB).
 
 ### 2. Pull the pinned runtime and model
 
@@ -165,6 +170,8 @@ This stack uses probabilistic drafting with block rejection. The two Gumbel over
 
 ## Performance
 
+**Validated baseline: 1× MI300X, TP=1. TP=2 runtime validation: pending** — every figure below (this table, the concurrency sweep, and the prefill numbers) was measured on TP=1 and must be re-measured on the 2-GPU deployment; see [Tensor parallel](#tensor-parallel-2-mi300x).
+
 Key optimizations in the production configuration:
 
 | Change | Effect |
@@ -196,8 +203,10 @@ With the tuned kernels, uncached prefill reaches **7.9–8.5K tok/s**, depending
 
 ## Production notes
 
-- **HBM headroom is limited.** The warmed high-water mark is 204.5 of 205.8 GB. A 30 GB KV pool loads but fails during graph capture with `HSA_STATUS_ERROR_OUT_OF_RESOURCES`. Do not raise `--kv-cache-memory-bytes`; monitor HBM usage for growth.
-- **The CPU KV tier stores cache entries, not weights.** `--kv-offloading-size 96 --kv-offloading-backend native` maps ~103 GB in `/dev/shm` for evicted prefix-cache entries. The entrypoint removes stale mappings after crashes.
+**The notes below (HBM high-water mark, BFCL score, needle-recall timings) are from the validated TP=1 baseline** and have not been re-measured under TP=2.
+
+- **HBM headroom is limited (TP=1).** The warmed high-water mark is 204.5 of 205.8 GB on one GPU. A 30 GB KV pool loads but fails during graph capture with `HSA_STATUS_ERROR_OUT_OF_RESOURCES`. Do not raise `--kv-cache-memory-bytes` (remember it is a **per-GPU** reservation — at TP=2 it applies per rank, not once in aggregate); monitor HBM usage for growth.
+- **The CPU KV tier stores cache entries, not weights.** `--kv-offloading-size 96 --kv-offloading-backend native` maps ~103 GB in `/dev/shm` for evicted prefix-cache entries; this size is the **aggregate across all TP ranks**, not per GPU. The entrypoint removes stale mappings after crashes.
 - **The 1,664-token scheduler warning is expected.** DSpark-7 reserves draft slots from the 2,048-token budget. Raising the budget reserves more in-flight sliding-window state and reduces usable KV capacity.
 - **Warm the kernels after restart.** The first prefill initializes kernels and takes 5.3 s for 8.9K tokens; subsequent runs take 1.7 s. Run one uncached prefill before admitting traffic.
 - **Test correctness as well as throughput.** The validation suite includes two-turn tool-calling fixtures, a BFCL subset (74–76/90 exact calls), OpenCode tool-schema checks, and 380K-token needle recall on both native and DSpark paths. Cold and cached prefills can take different floating-point paths, so test both.

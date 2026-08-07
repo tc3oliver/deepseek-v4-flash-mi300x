@@ -18,8 +18,11 @@ jobs:
       - name: Install Python deps
         run: pip install --quiet pyyaml pytest
 
-      - name: Overlay integrity (host mode: SHA256 + mapping vs compose)
+      - name: "Overlay integrity (host mode: SHA256 + mapping vs compose)"
         run: python3 scripts/validate_overlays.py
+
+      - name: "Provenance diff freshness (overlay changed vs stale diff)"
+        run: python3 scripts/validate_diff_freshness.py
 
       - name: CSV + overlay tests
         run: python3 -m pytest -q
@@ -43,3 +46,12 @@ jobs:
             sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
             shellcheck vllm-entrypoint.sh
           fi
+
+      - name: "docker compose config"
+        run: |
+          if ! docker compose version >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq docker-compose-plugin
+          fi
+          docker compose version
+          docker compose -f compose.yaml config -q
