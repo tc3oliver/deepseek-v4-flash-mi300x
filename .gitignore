@@ -11,3 +11,6 @@ Caddyfile
 *.swp
 *.swo
 __pycache__/
+
+# Tooling / operational state (not part of the stack)
+.omc/

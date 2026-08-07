@@ -1,0 +1,45 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: pip install --quiet pyyaml pytest
+
+      - name: Overlay integrity (host mode: SHA256 + mapping vs compose)
+        run: python3 scripts/validate_overlays.py
+
+      - name: CSV + overlay tests
+        run: python3 -m pytest -q
+
+      - name: Python syntax check (all overlays + scripts)
+        run: |
+          python3 - <<'PY'
+          import ast, glob, sys
+          files = glob.glob('patches/*.py') + glob.glob('scripts/*.py')
+          for f in sorted(files):
+              ast.parse(open(f).read())
+              print('syntax OK:', f)
+          print(f'checked {len(files)} file(s)')
+          PY
+
+      - name: shellcheck entrypoint
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck vllm-entrypoint.sh
+          else
+            sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+            shellcheck vllm-entrypoint.sh
+          fi

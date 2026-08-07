@@ -52,6 +52,8 @@ This repository adds:
 │   └── README.md       # Provenance and regeneration instructions
 └── tuning/
     └── *.csv           # AITER A8W8 blockscale tuning tables for gfx942
+                       # (gfx950 rows retained separately in *.gfx950.reference.csv;
+                       #  the production overlay loads gfx942 rows only)
 ```
 
 ## Runtime configuration
@@ -59,11 +61,19 @@ This repository adds:
 The stack uses a digest-pinned official vLLM ROCm nightly with:
 
 - `--trust-remote-code` and the DeepSeek V4 tokenizer, reasoning, and tool parsers
-- `fp8_ds_mla` KV cache (UE8M0 block-scaled FP8, not generic unscaled FP8) with 256-token blocks
+- KV cache: the CLI passes `--kv-cache-dtype fp8`; for DeepSeek V4 MLA, the pinned vLLM revision resolves this alias to `fp8_ds_mla` (UE8M0 block-scaled FP8, not generic unscaled FP8) with 256-token blocks. No forcing flag is added.
 - `VLLM_ROCM_USE_AITER=1` and `--moe-backend triton`; Triton OGS handles the grouped MXFP4 experts, while AITER handles attention and dense linear layers
 - DSpark-7 speculative decoding with probabilistic drafting and block rejection
 - full/breakable CUDA graph capture, giving one graph launch per token during steady decode
 - Caddy as an IP-allowlisted HTTPS proxy
+
+## Tensor parallel (2× MI300X)
+
+`compose.yaml` defaults to `--tensor-parallel-size 2` across two MI300X devices, using **pure tensor parallel — expert parallel is NOT enabled**. Under pure TP the 256 routed experts are not partitioned across ranks, so `num_local_experts` stays 256 and the gfx942 fast-routing and OGS geometry gates (both keyed on `== 256`) remain active. RCCL uses its defaults; both GPUs are reached through the existing `/dev/kfd` + `/dev/dri` device mounts and `ipc: host` (no extra RCCL environment is set — add one only if a runtime issue on your host demands it, and record why).
+
+Requirements beyond the single-GPU stack: a second MI300X (`gfx942`) on the same host and working ROCm peer access between the two GPUs. For single-GPU operation, set `--tensor-parallel-size` to `1`.
+
+The single-stream and prefill numbers below were measured on one MI300X (TP=1); TP=2 throughput characteristics differ and must be re-measured. TP=2 correctness (tool-calling fixtures, long-context needle recall) must be re-validated on the 2-GPU host.
 
 ## Deploying it
 
@@ -159,7 +169,7 @@ Key optimizations in the production configuration:
 
 | Change | Effect |
 | --- | --- |
-| Tune 21 recurring A8W8 GEMM shapes for 304-CU `gfx942` | +42–62% single/double-stream decode; +10–35% at 8–64 streams |
+| Tune 41 gfx942 A8W8 GEMM entries (39 unique `(M,N,K)` shapes; 2 are shared across the base + bpreshuffle kernel families) for 304-CU `gfx942` | +42–62% single/double-stream decode; +10–35% at 8–64 streams |
 | Fused SiLU, fast DeepSeek routing, batch-sensitive expert tiles | Native C1 decode 34.5 → 56.6 tok/s (+64%); routing kernel 42.6 → 11.9 µs/layer |
 | `BLOCK_H=64` sparse-prefill tile | Prefill reaches 7.9–8.5K tok/s; sparse-attention trace 317 → 142 ms per request |
 | Static K=7, probabilistic + block rejection, causal verify | 119.5 tok/s single-stream with correct output |

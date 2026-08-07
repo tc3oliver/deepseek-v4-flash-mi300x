@@ -1516,6 +1516,7 @@ class OAITritonMxfp4ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             w1=w1,
             w2=w2,
             gating_output=router_logits,
+            activation=activation,
             topk=self.topk,
             renormalize=self.renormalize,
             global_num_experts=global_num_experts,

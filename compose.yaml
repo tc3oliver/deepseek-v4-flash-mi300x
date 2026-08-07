@@ -38,6 +38,9 @@ services:
       - ./patches/spec-decode-utils.independent-draft-gumbel.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/utils.py:ro
       # Fence native CPU KV transfers behind in-flight compute (vLLM #47282 / PR #47291).
       - ./patches/kv_offload_cpu_gpu_worker.load-war.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/cpu/gpu_worker.py:ro
+      # Startup integrity guard: SHA256 pins + overlay canary (scripts/validate_overlays.py).
+      - ./SHA256SUMS:/opt/SHA256SUMS:ro
+      - ./scripts/validate_overlays.py:/opt/validate_overlays.py:ro
     entrypoint: [/opt/vllm-entrypoint.sh]
     command:
       - /root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062
@@ -58,6 +61,13 @@ services:
       - deepseek_v4
       - --enable-auto-tool-choice
       - --enable-prompt-tokens-details
+      # Pure tensor parallel across 2× MI300X. Expert parallel is NOT enabled,
+      # so global experts stay 256 and num_local_experts stays 256 per rank —
+      # the fast-routing and gfx942 OGS gates (both keyed on ==256) stay active.
+      # RCCL uses its defaults; both GPUs are visible via /dev/kfd + /dev/dri.
+      # For single-GPU use, set this to "1".
+      - --tensor-parallel-size
+      - "2"
       - --kv-cache-dtype
       - fp8
       - --block-size
