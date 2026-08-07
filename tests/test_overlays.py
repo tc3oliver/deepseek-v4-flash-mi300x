@@ -3,12 +3,14 @@
 These are the CI counterpart to ``scripts/validate_overlays.py`` (host mode):
 every pinned artifact matches its SHA256, every overlay source is pinned, and the
 embedded source->target MAPPING matches the bind-mounts declared in compose.yaml.
+
+Provenance diff freshness (network-based) is NOT tested here — it runs exactly
+once in CI as a standalone step (``python3 scripts/validate_diff_freshness.py``
+in ``.github/workflows/validate.yml``) so upstream files are fetched only once
+per run. See ``tests/test_diff_freshness.py`` for the offline logic tests.
 """
 from pathlib import Path
 
-import pytest
-
-import validate_diff_freshness as vdf
 import validate_overlays as vo
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -39,19 +41,3 @@ def test_ci_integrity_checks_pass():
     """The full host-mode gate: SHA256 of every pinned file + mapping sanity."""
     errors = vo.run_ci_checks(_pins())
     assert errors == [], "CI integrity checks failed:\n  - " + "\n  - ".join(errors)
-
-
-def test_provenance_diffs_are_fresh():
-    """Detects: overlay content changed but patches/diffs/NN-*.patch is stale.
-
-    Requires network access to fetch each pinned upstream base from GitHub; skips
-    (does not falsely pass or fail) when no base is reachable at all.
-    """
-    exit_code = vdf.run()
-    if exit_code == 0:
-        return  # either all-fresh, or a clean NOT-RUN (no network at all)
-    pytest.fail(
-        "Provenance diff freshness check failed — a full-file overlay changed "
-        "without regenerating its patches/diffs/NN-*.patch. Re-run "
-        "`python3 scripts/validate_diff_freshness.py` locally for details."
-    )

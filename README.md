@@ -116,7 +116,20 @@ docker compose up -d
 docker compose logs -f inference
 ```
 
-A healthy start takes ~5 minutes and must show all of:
+A healthy start takes ~5 minutes. For the default `TP=2` deployment, confirm these non-numeric startup signals in the logs (in roughly this order) — exact figures depend on GPU count and are not asserted here:
+
+```text
+... rank 0 / rank 1 ... (both TP workers initialized)
+... RCCL / NCCL ... (distributed / process group initialization completed)
+Model loading took ... GiB
+DSpark draft model loaded: 96 params
+Capturing CUDA graphs (FULL)
+Application startup complete
+```
+
+If any of these are missing — most commonly one TP worker never reports initialized, or distributed init hangs/errors — the server did not come up correctly even if the process is still running. TP=2 memory, KV-cache-size, concurrency, and HBM high-water-mark figures have not been re-measured on 2 GPUs; do not use the TP=1 numbers below as a pass/fail check.
+
+**Validated TP=1 baseline** (measured with `--tensor-parallel-size 1`; not re-verified under TP=2), the same startup previously showed:
 
 ```text
 Model loading took 156.67 GiB
@@ -128,7 +141,7 @@ Capturing CUDA graphs (FULL)
 Application startup complete
 ```
 
-After graph capture, run `rocm-smi --showmeminfo vram`. The warmed high-water mark is ~204.5 GB of 205.8 GB. If only a few hundred MB remain, the server may start but fail on the first request.
+After graph capture on that TP=1 baseline, `rocm-smi --showmeminfo vram` showed a warmed high-water mark of ~204.5 GB of 205.8 GB on the single GPU; if only a few hundred MB remained, the server would start but fail on the first request. The equivalent TP=2 per-GPU high-water mark is unmeasured — check `rocm-smi --showmeminfo vram` on both GPUs against their own headroom rather than assuming this figure.
 
 ### 5. Smoke-test
 
